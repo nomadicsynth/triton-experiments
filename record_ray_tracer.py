@@ -71,8 +71,14 @@ def raytrace_kernel(img_ptr,
     x = offs % W
     mask = (x < W) & (y < H)
 
-    u = (x / W) * 2 - 1
-    v = (y / H) * 2 - 1
+    # Use pixel-center sampling and correct aspect ratio so images don't stretch
+    # Avoid calling tl.float32(...) directly; use float literals so Triton promotes types
+    x_f = x + 0.5
+    y_f = y + 0.5
+    u = (x_f / W) * 2.0 - 1.0
+    v = (y_f / H) * 2.0 - 1.0
+    # Scale horizontal coordinate by aspect ratio (width/height)
+    u = u * (W / H)
 
     rd_x = u
     rd_y = v
