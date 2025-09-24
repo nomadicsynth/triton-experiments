@@ -8,12 +8,7 @@ import cv2
 import argparse
 import subprocess
 import shutil
-try:
-    from tqdm import tqdm
-    _has_tqdm = True
-except Exception:
-    tqdm = None
-    _has_tqdm = False
+from tqdm import tqdm
 
 # This script is derived from ray-tracer-1.py and records frames to a video file.
 
@@ -314,25 +309,17 @@ if use_ffmpeg:
     ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE,
                                    stdout=subprocess.DEVNULL,
                                    stderr=subprocess.DEVNULL)
-    if _has_tqdm:
-        tqdm.write(f"Streaming frames to ffmpeg -> {OUT_FILE}")
-    else:
-        print(f"Streaming frames to ffmpeg -> {OUT_FILE}")
+    tqdm.write(f"Streaming frames to ffmpeg -> {OUT_FILE}")
 else:
     writer = cv2.VideoWriter(OUT_FILE, fourcc, FPS, (W, H))
 
-if _has_tqdm:
-    tqdm.write(f"Rendering {FRAMES} frames ({FRAMES/FPS:.1f}s) to {OUT_FILE} at {FPS} FPS ({W}x{H})")
-else:
-    print(f"Rendering {FRAMES} frames ({FRAMES/FPS:.1f}s) to {OUT_FILE} at {FPS} FPS ({W}x{H})")
+tqdm.write(f"Rendering {FRAMES} frames ({FRAMES/FPS:.1f}s) to {OUT_FILE} at {FPS} FPS ({W}x{H})")
 
 start_time = time.time()
 frame_time_start = time.time()
 
 try:
-    iterator = range(FRAMES)
-    if _has_tqdm:
-        iterator = tqdm(range(FRAMES), desc="Rendering", unit="frame")
+    iterator = tqdm(range(FRAMES), desc="Rendering", unit="frame")
     for frame in iterator:
         t_scalar = frame * 0.04
         t_sin = math.sin(t_scalar)
@@ -376,29 +363,14 @@ try:
             try:
                 ffmpeg_proc.stdin.write(frame_bgr.tobytes())
             except BrokenPipeError:
-                if _has_tqdm:
-                    tqdm.write("ffmpeg pipe closed unexpectedly")
-                else:
-                    print("ffmpeg pipe closed unexpectedly")
+                tqdm.write("ffmpeg pipe closed unexpectedly")
                 break
         else:
             writer.write(frame_bgr)
 
         # Update tqdm or periodic print for progress
-        if _has_tqdm:
-            # tqdm handles ETA display
-            iterator.set_postfix({'avg_fps': f"{(frame+1)/max(1e-6, time.time()-start_time):.2f}"})
-        else:
-            if (frame + 1) % 30 == 0 or frame == 0 or frame == FRAMES - 1:
-                elapsed = time.time() - start_time
-                completed = frame + 1
-                avg_fps = completed / elapsed if elapsed > 0 else 0.0
-                remaining = FRAMES - completed
-                eta = remaining / avg_fps if avg_fps > 0 else float('inf')
-                if _has_tqdm:
-                    tqdm.write(f"Rendered {completed}/{FRAMES} frames — avg {avg_fps:.2f} FPS — ETA {eta:.1f}s")
-                else:
-                    print(f"Rendered {completed}/{FRAMES} frames — avg {avg_fps:.2f} FPS — ETA {eta:.1f}s")
+        # Update tqdm postfix with average FPS
+        iterator.set_postfix({'avg_fps': f"{(frame+1)/max(1e-6, time.time()-start_time):.2f}"})
 
 except Exception as e:
     print("Error during rendering:", e)
@@ -412,7 +384,4 @@ finally:
     if writer is not None:
         writer.release()
     total = time.time() - start_time
-    if _has_tqdm:
-        tqdm.write(f"Done: {FRAMES} frames in {total:.2f}s => {FRAMES/total:.2f} FPS (overall)")
-    else:
-        print(f"Done: {FRAMES} frames in {total:.2f}s => {FRAMES/total:.2f} FPS (overall)")
+    tqdm.write(f"Done: {FRAMES} frames in {total:.2f}s => {FRAMES/total:.2f} FPS (overall)")
