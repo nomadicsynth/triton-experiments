@@ -7,6 +7,5 @@ triton
 PyOpenGL
 glfw
 cuda-python
-pycuda
 tqdm
 
