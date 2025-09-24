@@ -22,6 +22,10 @@ parser.add_argument("--width", type=int, default=1024, help="Frame width")
 parser.add_argument("--height", type=int, default=1024, help="Frame height")
 parser.add_argument("--music", type=str, default=None, help="Path to music/audio file to add as an audio track")
 parser.add_argument("--loop-music", action="store_true", help="Loop the music to match video duration when muxing")
+parser.add_argument("--video-fade-in", type=float, default=0.0, help="Video fade in duration in seconds")
+parser.add_argument("--video-fade-out", type=float, default=0.0, help="Video fade out duration in seconds")
+parser.add_argument("--audio-fade-in", type=float, default=0.0, help="Audio fade in duration in seconds")
+parser.add_argument("--audio-fade-out", type=float, default=0.0, help="Audio fade out duration in seconds")
 args = parser.parse_args()
 
 H, W = args.height, args.width
@@ -32,6 +36,7 @@ OUT_FILE = args.out
 # extending the video to match a longer audio track). This is passed to ffmpeg
 # as the '-t' output option.
 DURATION_SECONDS_STR = f"{FRAMES / FPS:.6f}"
+DURATION_SECONDS = FRAMES / FPS
 
 # Ensure the parent directory for the output file exists. If the user supplied
 # a path containing directories that don't yet exist, create them so ffmpeg
@@ -315,6 +320,14 @@ ffmpeg_proc = None
 music_path = args.music
 loop_music = args.loop_music
 
+# Validate fade durations
+if args.video_fade_in + args.video_fade_out > DURATION_SECONDS:
+    print("Video fade in and out durations combined cannot exceed video duration")
+    sys.exit(1)
+if music_path is not None and args.audio_fade_in + args.audio_fade_out > DURATION_SECONDS:
+    print("Audio fade in and out durations combined cannot exceed video duration")
+    sys.exit(1)
+
 if not use_ffmpeg:
     print("This script requires ffmpeg to write video. Please install ffmpeg.")
     sys.exit(1)
@@ -361,6 +374,21 @@ if music_path is not None:
     ffmpeg_cmd += ['-map', '0:v:0', '-map', '1:a:0', '-c:a', 'aac', '-b:a', '192k']
 else:
     ffmpeg_cmd += ['-an']
+# Add fade filters
+if args.video_fade_in > 0 or args.video_fade_out > 0:
+    vf_parts = []
+    if args.video_fade_in > 0:
+        vf_parts.append(f"fade=t=in:st=0:d={args.video_fade_in}")
+    if args.video_fade_out > 0:
+        vf_parts.append(f"fade=t=out:st={DURATION_SECONDS - args.video_fade_out}:d={args.video_fade_out}")
+    ffmpeg_cmd += ['-filter:v', ','.join(vf_parts)]
+if music_path is not None and (args.audio_fade_in > 0 or args.audio_fade_out > 0):
+    af_parts = []
+    if args.audio_fade_in > 0:
+        af_parts.append(f"afade=t=in:st=0:d={args.audio_fade_in}")
+    if args.audio_fade_out > 0:
+        af_parts.append(f"afade=t=out:st={DURATION_SECONDS - args.audio_fade_out}:d={args.audio_fade_out}")
+    ffmpeg_cmd += ['-filter:a', ','.join(af_parts)]
 # Ensure ffmpeg produces a file with the exact requested duration.
 ffmpeg_cmd += ['-t', DURATION_SECONDS_STR]
 ffmpeg_cmd += ['-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'fast', OUT_FILE]
