@@ -4,3 +4,7 @@ opencv-python
 pillow
 torch
 triton
+PyOpenGL
+glfw
+cuda-python
+pycuda
