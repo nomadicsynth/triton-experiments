@@ -4,7 +4,6 @@ import torch
 from PIL import Image
 import time
 import math
-import cv2
 import argparse
 import subprocess
 import shutil
@@ -21,7 +20,6 @@ parser.add_argument("--out", type=str, default="out_video.mp4", help="Output vid
 parser.add_argument("--fps", type=int, default=60, help="Frames per second")
 parser.add_argument("--width", type=int, default=1024, help="Frame width")
 parser.add_argument("--height", type=int, default=1024, help="Frame height")
-parser.add_argument("--no-ffmpeg", action="store_true", help="Do not use ffmpeg; write with OpenCV instead")
 parser.add_argument("--music", type=str, default=None, help="Path to music/audio file to add as an audio track")
 parser.add_argument("--loop-music", action="store_true", help="Loop the music to match video duration when muxing")
 args = parser.parse_args()
@@ -308,12 +306,14 @@ host_img = torch.empty((H, W, 3), dtype=torch.uint8, pin_memory=True)
 copy_stream = torch.cuda.Stream()
 copy_done = torch.cuda.Event(enable_timing=False)
 
-fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-use_ffmpeg = (not args.no_ffmpeg) and (shutil.which("ffmpeg") is not None)
+use_ffmpeg = shutil.which("ffmpeg") is not None
 ffmpeg_proc = None
-writer = None
 music_path = args.music
 loop_music = args.loop_music
+
+if not use_ffmpeg:
+    print("This script requires ffmpeg to write video. Please install ffmpeg.")
+    sys.exit(1)
 
 # Sanity-check the music file early so we fail fast if path is invalid
 if music_path is not None:
@@ -342,40 +342,26 @@ if music_path is not None:
     else:
         # No ffmpeg/ffprobe available; warn but continue — muxing will fail later if attempted
         tqdm.write("Warning: ffprobe/ffmpeg not found; cannot verify audio file before rendering.")
-if use_ffmpeg:
-    # Spawn ffmpeg to read raw BGR24 frames from stdin and encode to mp4
-    ffmpeg_cmd = ["ffmpeg", '-y']
-    # Video input from stdin
-    ffmpeg_cmd += ['-f', 'rawvideo', '-pix_fmt', 'bgr24', '-s', f"{W}x{H}", '-r', str(FPS), '-i', '-']
-    if music_path is not None:
-        # If music provided, add it as a second input. If looping desired, use -stream_loop.
-        if loop_music:
-            # Use -stream_loop before the input to loop the audio indefinitely (-1 loops forever)
-            ffmpeg_cmd += ['-stream_loop', '-1']
-        ffmpeg_cmd += ['-i', music_path]
-        # Map video from first input and audio from second, set audio codec
-        ffmpeg_cmd += ['-map', '0:v:0', '-map', '1:a:0', '-c:a', 'aac', '-b:a', '192k']
-    else:
-        ffmpeg_cmd += ['-an']
-    ffmpeg_cmd += ['-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'fast', OUT_FILE]
-    # Silence ffmpeg's console output by redirecting stdout/stderr to DEVNULL
-    ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE,
-                                   stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.DEVNULL)
-    tqdm.write(f"Streaming frames to ffmpeg -> {OUT_FILE}")
-else:
-    writer = cv2.VideoWriter(OUT_FILE, fourcc, FPS, (W, H))
 
-    # If using OpenCV writer and music is provided, we will mux audio after writing the file
-    tmp_outfile = None
-    if music_path is not None:
-        # write to a temp file first, then mux audio into OUT_FILE at the end
-        fd, tmp_path = tempfile.mkstemp(suffix=os.path.splitext(OUT_FILE)[1])
-        os.close(fd)
-        tmp_outfile = tmp_path
-        # replace writer to write to tmp_outfile instead
-        writer.release()
-        writer = cv2.VideoWriter(tmp_outfile, fourcc, FPS, (W, H))
+# Spawn ffmpeg to read raw BGR24 frames from stdin and encode to mp4
+ffmpeg_cmd = ["ffmpeg", '-y']
+# Video input from stdin
+ffmpeg_cmd += ['-f', 'rawvideo', '-pix_fmt', 'bgr24', '-s', f"{W}x{H}", '-r', str(FPS), '-i', '-']
+if music_path is not None:
+    # If music provided, add it as a second input. If looping desired, use -stream_loop.
+    if loop_music:
+        # Use -stream_loop before the input to loop the audio indefinitely (-1 loops forever)
+        ffmpeg_cmd += ['-stream_loop', '-1']
+    ffmpeg_cmd += ['-i', music_path]
+    # Map video from first input and audio from second, set audio codec
+    ffmpeg_cmd += ['-map', '0:v:0', '-map', '1:a:0', '-c:a', 'aac', '-b:a', '192k']
+else:
+    ffmpeg_cmd += ['-an']
+ffmpeg_cmd += ['-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'fast', OUT_FILE]
+# Silence ffmpeg's console output by redirecting stdout/stderr to DEVNULL
+ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
 
 tqdm.write(f"Rendering {FRAMES} frames ({FRAMES/FPS:.1f}s) to {OUT_FILE} at {FPS} FPS ({W}x{H})")
 
@@ -422,17 +408,14 @@ try:
         # Wait for copy to complete then write frame
         copy_done.synchronize()
         frame_bgr = host_img.numpy()[..., ::-1]
-        if use_ffmpeg and ffmpeg_proc is not None:
+        if ffmpeg_proc is not None:
             # write raw bytes to ffmpeg stdin
             try:
                 ffmpeg_proc.stdin.write(frame_bgr.tobytes())
             except BrokenPipeError:
                 tqdm.write("ffmpeg pipe closed unexpectedly")
                 break
-        else:
-            writer.write(frame_bgr)
-
-        # Update tqdm or periodic print for progress
+        
         # Update tqdm postfix with average FPS
         iterator.set_postfix({'avg_fps': f"{(frame+1)/max(1e-6, time.time()-start_time):.2f}"})
 
@@ -445,31 +428,5 @@ finally:
             ffmpeg_proc.wait()
         except Exception:
             pass
-    if writer is not None:
-        writer.release()
-    # If we wrote a temp file with OpenCV and a music file was provided, mux audio now
-    if not use_ffmpeg and music_path is not None and tmp_outfile is not None:
-        if shutil.which('ffmpeg') is None:
-            tqdm.write("ffmpeg not found: cannot mux audio into video written by OpenCV")
-        else:
-            # Build ffmpeg command to combine tmp_outfile (video) with music_path (audio)
-            # If loop requested, use -stream_loop -1 for the audio input and -shortest to stop at video length
-            mux_cmd = [
-                'ffmpeg', '-y',
-                '-i', tmp_outfile,
-            ]
-            if loop_music:
-                mux_cmd += ['-stream_loop', '-1']
-            mux_cmd += ['-i', music_path, '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-shortest', OUT_FILE]
-            try:
-                subprocess.run(mux_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                # Remove tmp file
-                try:
-                    os.remove(tmp_outfile)
-                except Exception:
-                    pass
-                tqdm.write(f"Muxed audio into {OUT_FILE}")
-            except subprocess.CalledProcessError:
-                tqdm.write("Failed to mux audio with ffmpeg")
     total = time.time() - start_time
     tqdm.write(f"Done: {FRAMES} frames in {total:.2f}s => {FRAMES/total:.2f} FPS (overall)")
