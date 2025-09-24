@@ -14,6 +14,13 @@ from tqdm import tqdm
 
 # This script is derived from ray-tracer-1.py and records frames to a video file.
 
+# Usage notes:
+# - This repository provides a virtualenv at `.venv`. To run the script using that
+#   environment use the Python executable at `.venv/bin/python`, for example:
+#
+#   .venv/bin/python record_ray_tracer.py --width 320 --height 240 --frames 600 \
+#       --out out_video.mp4 --fps 30 --intro-text "My Demo" --intro-duration 3.0
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--frames", type=int, default=1200, help="Number of frames to render (default 1200 -> 20s at 60fps)")
 parser.add_argument("--out", type=str, default="out_video.mp4", help="Output video filename")
