@@ -1,0 +1,3 @@
+`golden_bay_1k.exr` is available from Poly Haven at https://polyhaven.com/a/golden_bay
+
+Attribution: "Golden Bay" by Greg Zaal [https://gregzaal.com/], licensed under CC0. [https://polyhaven.com/a/golden_bay]
