@@ -2,9 +2,13 @@ import triton
 import triton.language as tl
 import torch
 import math
-import OpenEXR
-import Imath
 import numpy as np
+try:
+    import OpenEXR
+    import Imath
+except Exception:
+    OpenEXR = None
+    Imath = None
 
 # Tune block size
 BLOCK: int = 256
@@ -20,77 +24,14 @@ def tonemap_kernel(src_ptr, dst_ptr, n_elements, BLOCK: tl.constexpr):
     tl.store(dst_ptr + offs, v.to(tl.uint8), mask=mask)
 
 @triton.jit
-def atan(x):
-    pi_half = 1.5707963267948966
-    abs_x = tl.abs(x)
-    # For |x| <= 1, use Taylor series
-    x2 = x * x
-    x3 = x2 * x
-    x5 = x3 * x2
-    x7 = x5 * x2
-    res_small = x - x3 / 3 + x5 / 5 - x7 / 7
-    # For |x| > 1, use atan(x) = pi/2 - atan(1/x) for x > 0, -pi/2 - atan(1/x) for x < 0
-    inv_x = 1 / x
-    inv_x2 = inv_x * inv_x
-    inv_x3 = inv_x2 * inv_x
-    inv_x5 = inv_x3 * inv_x2
-    inv_x7 = inv_x5 * inv_x2
-    atan_inv = inv_x - inv_x3 / 3 + inv_x5 / 5 - inv_x7 / 7
-    res_large = tl.where(x > 0, pi_half - atan_inv, -pi_half - atan_inv)
-    return tl.where(abs_x <= 1, res_small, res_large)
-
-@triton.jit
-def atan2(y, x):
-    pi = 3.141592653589793
-    res = atan(y / x)
-    res = tl.where(x < 0, res + tl.where(y >= 0, pi, -pi), res)
-    return res
-
-@triton.jit
-def dir_to_uv(rd_x, rd_y, rd_z):
-    theta = atan2( tl.sqrt(1 - rd_z*rd_z), rd_z )
-    phi = atan2(rd_y, rd_x)
-    u = (phi + 3.141592653589793) / (2 * 3.141592653589793)
-    v = theta / 3.141592653589793
-    return u, v
-
-@triton.jit
-def sample_hdri(hdri_ptr, u, v, hdri_w, hdri_h):
-    x = u * (hdri_w - 1)
-    y = v * (hdri_h - 1)
-    x0 = tl.floor(x)
-    y0 = tl.floor(y)
-    x1 = tl.minimum(x0 + 1, hdri_w - 1)
-    y1 = tl.minimum(y0 + 1, hdri_h - 1)
-    fx = x - x0
-    fy = y - y0
-    idx00 = ((y0 * hdri_w + x0) * 3).to(tl.int32)
-    idx01 = ((y0 * hdri_w + x1) * 3).to(tl.int32)
-    idx10 = ((y1 * hdri_w + x0) * 3).to(tl.int32)
-    idx11 = ((y1 * hdri_w + x1) * 3).to(tl.int32)
-    r00 = tl.load(hdri_ptr + idx00 + 0)
-    g00 = tl.load(hdri_ptr + idx00 + 1)
-    b00 = tl.load(hdri_ptr + idx00 + 2)
-    r01 = tl.load(hdri_ptr + idx01 + 0)
-    g01 = tl.load(hdri_ptr + idx01 + 1)
-    b01 = tl.load(hdri_ptr + idx01 + 2)
-    r10 = tl.load(hdri_ptr + idx10 + 0)
-    g10 = tl.load(hdri_ptr + idx10 + 1)
-    b10 = tl.load(hdri_ptr + idx10 + 2)
-    r11 = tl.load(hdri_ptr + idx11 + 0)
-    g11 = tl.load(hdri_ptr + idx11 + 1)
-    b11 = tl.load(hdri_ptr + idx11 + 2)
-    r = (1-fx)*(1-fy)*r00 + fx*(1-fy)*r01 + (1-fx)*fy*r10 + fx*fy*r11
-    g = (1-fx)*(1-fy)*g00 + fx*(1-fy)*g01 + (1-fx)*fy*g10 + fx*fy*g11
-    b = (1-fx)*(1-fy)*b00 + fx*(1-fy)*b01 + (1-fx)*fy*b10 + fx*fy*b11
-    return r, g, b
-
-@triton.jit
 def raytrace_kernel(img_ptr,
                     eye_ptr, light_ptr,
                     sx_ptr, sy_ptr, sz_ptr, sr_ptr, refl_ptr, shine_ptr,
                     t_sin, t_cos, num_spheres,
-                    hdri_ptr, hdri_w, hdri_h,
+                    rd_x_ptr, rd_y_ptr, rd_z_ptr,
+                    in_hit_ptr,
+                    refl_dir_x_ptr, refl_dir_y_ptr, refl_dir_z_ptr, refl_t_ptr,
+                    hit_refl_ptr,
                     H: tl.constexpr, W: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
@@ -114,9 +55,6 @@ def raytrace_kernel(img_ptr,
     rd_x *= inv_len
     rd_y *= inv_len
     rd_z *= inv_len
-
-    bg_u, bg_v = dir_to_uv(rd_x, rd_y, rd_z)
-    bg_r, bg_g, bg_b = sample_hdri(hdri_ptr, bg_u, bg_v, hdri_w, hdri_h)
 
     eye_x = tl.load(eye_ptr + 0)
     eye_y = tl.load(eye_ptr + 1)
@@ -173,9 +111,14 @@ def raytrace_kernel(img_ptr,
         hit_shine = tl.where(valid, s_shine, hit_shine)
 
     in_hit = closest_t < 1e9
-    out_r = tl.where(~in_hit, bg_r, tl.zeros([BLOCK], dtype=tl.float32))
-    out_g = tl.where(~in_hit, bg_g, tl.zeros([BLOCK], dtype=tl.float32))
-    out_b = tl.where(~in_hit, bg_b, tl.zeros([BLOCK], dtype=tl.float32))
+    out_r = tl.zeros([BLOCK], dtype=tl.float32)
+    out_g = tl.zeros([BLOCK], dtype=tl.float32)
+    out_b = tl.zeros([BLOCK], dtype=tl.float32)
+    # initialize reflection outputs so they exist even when there is no hit
+    refl_dir_x = tl.zeros([BLOCK], dtype=tl.float32)
+    refl_dir_y = tl.zeros([BLOCK], dtype=tl.float32)
+    refl_dir_z = tl.zeros([BLOCK], dtype=tl.float32)
+    refl_t = tl.zeros([BLOCK], dtype=tl.float32) + 1e9
 
     any_hit = tl.sum(in_hit.to(tl.int32), axis=0) > 0
 
@@ -240,6 +183,7 @@ def raytrace_kernel(img_ptr,
         log_term = tl.log2(spec_angle + eps_spec)
         specular = tl.exp2(hit_shine * log_term)
         base_color = ambient + diffuse + specular * 0.5
+
         out_r = tl.where(in_hit, base_color, out_r)
         out_g = tl.where(in_hit, base_color, out_g)
         out_b = tl.where(in_hit, base_color, out_b)
@@ -254,9 +198,7 @@ def raytrace_kernel(img_ptr,
         refl_dir_y *= inv_refl
         refl_dir_z *= inv_refl
         refl_t = tl.zeros([BLOCK], dtype=tl.float32) + 1e9
-        refl_r = tl.zeros([BLOCK], dtype=tl.float32)
-        refl_g = tl.zeros([BLOCK], dtype=tl.float32)
-        refl_b = tl.zeros([BLOCK], dtype=tl.float32)
+        refl_val = tl.zeros([BLOCK], dtype=tl.float32)
         refl_origin_x = hit_px + hit_nx * eps
         refl_origin_y = hit_py + hit_ny * eps
         refl_origin_z = hit_pz + hit_nz * eps
@@ -296,23 +238,33 @@ def raytrace_kernel(img_ptr,
             diff2 = nx2 * l2x + ny2 * l2y + nz2 * l2z
             diff2 = tl.maximum(diff2, 0.0)
             refl_t = tl.where(valid2, t_hit2, refl_t)
-            refl_r = tl.where(valid2, diff2, refl_r)
-            refl_g = tl.where(valid2, diff2, refl_g)
-            refl_b = tl.where(valid2, diff2, refl_b)
-        refl_u, refl_v = dir_to_uv(refl_dir_x, refl_dir_y, refl_dir_z)
-        no_refl_hit = refl_t >= 1e9
-        refl_bg_r, refl_bg_g, refl_bg_b = sample_hdri(hdri_ptr, refl_u, refl_v, hdri_w, hdri_h)
-        refl_r = tl.where(no_refl_hit, refl_bg_r, refl_r)
-        refl_g = tl.where(no_refl_hit, refl_bg_g, refl_g)
-        refl_b = tl.where(no_refl_hit, refl_bg_b, refl_b)
-        out_r = tl.where(in_hit, out_r * (1.0 - hit_refl) + refl_r * hit_refl, out_r)
-        out_g = tl.where(in_hit, out_g * (1.0 - hit_refl) + refl_g * hit_refl, out_g)
-        out_b = tl.where(in_hit, out_b * (1.0 - hit_refl) + refl_b * hit_refl, out_b)
+            refl_val = tl.where(valid2, diff2, refl_val)
+
+        out_r = tl.where(in_hit, out_r * (1.0 - hit_refl) + refl_val * hit_refl, out_r)
+        out_g = tl.where(in_hit, out_g * (1.0 - hit_refl) + refl_val * hit_refl, out_g)
+        out_b = tl.where(in_hit, out_b * (1.0 - hit_refl) + refl_val * hit_refl, out_b)
 
     offset = offs * 3
+    # store RGB
     tl.store(img_ptr + offset + 0, out_r, mask=mask)
     tl.store(img_ptr + offset + 1, out_g, mask=mask)
     tl.store(img_ptr + offset + 2, out_b, mask=mask)
+
+    # store primary ray direction and hit mask for host-side environment sampling
+    tl.store(rd_x_ptr + offs, rd_x, mask=mask)
+    tl.store(rd_y_ptr + offs, rd_y, mask=mask)
+    tl.store(rd_z_ptr + offs, rd_z, mask=mask)
+    # in_hit as float32 (0.0 or 1.0)
+    tl.store(in_hit_ptr + offs, in_hit.to(tl.float32), mask=mask)
+
+    # store reflection direction and reflection hit t (refl_t initialized to large if miss)
+    tl.store(refl_dir_x_ptr + offs, refl_dir_x, mask=mask)
+    tl.store(refl_dir_y_ptr + offs, refl_dir_y, mask=mask)
+    tl.store(refl_dir_z_ptr + offs, refl_dir_z, mask=mask)
+    tl.store(refl_t_ptr + offs, refl_t, mask=mask)
+
+    # store per-pixel material reflectivity used in blending
+    tl.store(hit_refl_ptr + offs, hit_refl, mask=mask)
 
 # Camera & light
 eye = torch.tensor([0.0, 0.0, -3.0], device="cuda")
@@ -333,66 +285,6 @@ sphere_z = base_spheres[:, 2].contiguous()
 sphere_r = base_spheres[:, 3].contiguous()
 sphere_reflect = base_spheres[:, 4].contiguous()
 sphere_shine = base_spheres[:, 5].contiguous()
-
-def load_hdri(path):
-    file = OpenEXR.InputFile(path)
-    dw = file.header()['dataWindow']
-    width = dw.max.x - dw.min.x + 1
-    height = dw.max.y - dw.min.y + 1
-    FLOAT = Imath.PixelType(Imath.PixelType.FLOAT)
-    rgb = [np.frombuffer(file.channel(c, FLOAT), dtype=np.float32).reshape(height, width) for c in "RGB"]
-    hdri = np.stack(rgb, axis=-1)
-    
-    # Rotate HDRI 90 degrees around X axis to orient landscape properly
-    # Create coordinate grids
-    j_grid, i_grid = np.meshgrid(np.arange(width), np.arange(height))
-    u = (j_grid + 0.5) / width
-    v = (i_grid + 0.5) / height
-    phi = (u - 0.5) * 2 * np.pi
-    theta = v * np.pi
-    
-    # Direction vectors
-    sin_theta = np.sin(theta)
-    x = sin_theta * np.cos(phi)
-    y = sin_theta * np.sin(phi)
-    z = np.cos(theta)
-    
-    # Apply 90 deg rotation around X axis: (x, y, z) -> (x, -z, y)
-    rot_x = x
-    rot_y = z
-    rot_z = -y
-    
-    # Compute new UV coordinates
-    rot_theta = np.arccos(np.clip(rot_z, -1, 1))
-    rot_phi = np.arctan2(rot_y, rot_x)
-    rot_u = (rot_phi + np.pi) / (2 * np.pi)
-    rot_v = rot_theta / np.pi
-    
-    # Bilinear sampling
-    rot_u = np.clip(rot_u, 0, 1)
-    rot_v = np.clip(rot_v, 0, 1)
-    x_f = rot_u * (width - 1)
-    y_f = rot_v * (height - 1)
-    x0 = np.floor(x_f).astype(int)
-    y0 = np.floor(y_f).astype(int)
-    x1 = np.minimum(x0 + 1, width - 1)
-    y1 = np.minimum(y0 + 1, height - 1)
-    fx = x_f - x0
-    fy = y_f - y0
-    
-    rotated_hdri = np.zeros_like(hdri)
-    for c in range(3):
-        v00 = hdri[y0, x0, c]
-        v01 = hdri[y0, x1, c]
-        v10 = hdri[y1, x0, c]
-        v11 = hdri[y1, x1, c]
-        rotated_hdri[i_grid, j_grid, c] = (1-fx)*(1-fy)*v00 + fx*(1-fy)*v01 + (1-fx)*fy*v10 + fx*fy*v11
-    
-    return rotated_hdri
-
-hdri = load_hdri('assets/hdri/golden_bay_1k.exr')
-hdri_tensor = torch.from_numpy(hdri).cuda()
-hdri_height, hdri_width, _ = hdri.shape
 
 def render_frame(frame_index, width, height):
     H, W = height, width
@@ -416,6 +308,17 @@ def render_frame(frame_index, width, height):
     t_sin = math.sin(t_scalar)
     t_cos = math.cos(t_scalar)
 
+    # allocate per-pixel buffers for ray dirs, hits and reflections
+    rd_x_dev = torch.empty(N_PIXELS, device="cuda", dtype=torch.float32)
+    rd_y_dev = torch.empty(N_PIXELS, device="cuda", dtype=torch.float32)
+    rd_z_dev = torch.empty(N_PIXELS, device="cuda", dtype=torch.float32)
+    in_hit_dev = torch.empty(N_PIXELS, device="cuda", dtype=torch.float32)
+    refl_dir_x_dev = torch.empty(N_PIXELS, device="cuda", dtype=torch.float32)
+    refl_dir_y_dev = torch.empty(N_PIXELS, device="cuda", dtype=torch.float32)
+    refl_dir_z_dev = torch.empty(N_PIXELS, device="cuda", dtype=torch.float32)
+    refl_t_dev = torch.empty(N_PIXELS, device="cuda", dtype=torch.float32)
+    hit_refl_dev = torch.empty(N_PIXELS, device="cuda", dtype=torch.float32)
+
     # Launch on default stream
     raytrace_kernel[grid](
         float_img,
@@ -430,13 +333,102 @@ def render_frame(frame_index, width, height):
         t_sin,
         t_cos,
         NUM_SPHERES,
-        hdri_tensor,
-        hdri_width,
-        hdri_height,
+        rd_x_dev,
+        rd_y_dev,
+        rd_z_dev,
+        in_hit_dev,
+        refl_dir_x_dev,
+        refl_dir_y_dev,
+        refl_dir_z_dev,
+        refl_t_dev,
+        hit_refl_dev,
         H,
         W,
         BLOCK
     )
+
+    # load HDRI (cached)
+    def _load_exr_to_cuda(path):
+        if OpenEXR is None or Imath is None:
+            # fallback to imageio if OpenEXR not available
+            try:
+                import imageio
+            except Exception:
+                raise RuntimeError("OpenEXR not available and imageio missing; cannot load EXR")
+            img = imageio.v3.imread(path, format='EXR-FI')
+            arr = np.asarray(img, dtype=np.float32)
+            return torch.from_numpy(arr).to(device='cuda')
+        f = OpenEXR.InputFile(path)
+        dw = f.header()['dataWindow']
+        W_exr = dw.max.x - dw.min.x + 1
+        H_exr = dw.max.y - dw.min.y + 1
+        pt = Imath.PixelType(Imath.PixelType.FLOAT)
+        chs = f.channels("RGB", pt)
+        r = np.frombuffer(chs[0], dtype=np.float32).reshape(H_exr, W_exr)
+        g = np.frombuffer(chs[1], dtype=np.float32).reshape(H_exr, W_exr)
+        b = np.frombuffer(chs[2], dtype=np.float32).reshape(H_exr, W_exr)
+        arr = np.stack([r, g, b], axis=2)
+        return torch.from_numpy(arr).to(device='cuda')
+
+    # cache HDRI tensor at module level to avoid reloading every frame
+    global _HDRI_TENSOR
+    if '_HDRI_TENSOR' not in globals():
+        try:
+            _HDRI_TENSOR = _load_exr_to_cuda('assets/hdri/golden_bay_1k.exr')
+        except Exception:
+            # fall back to a small constant environment if loading fails
+            _HDRI_TENSOR = torch.ones((16, 32, 3), device='cuda', dtype=torch.float32) * 0.2
+
+    hdr = _HDRI_TENSOR
+
+    # helper: sample equirectangular HDR by direction vectors (all tensors on CUDA)
+    def sample_equirect(hdr_tex, dir_x, dir_y, dir_z):
+        Hh, Wh, _ = hdr_tex.shape
+        # longitude (theta) around Y axis: atan2(x, z)
+        lon = torch.atan2(dir_x, dir_z)
+        lat = torch.asin(torch.clamp(dir_y, -1.0, 1.0))
+        u = (lon / (2.0 * math.pi)) + 0.5
+        v = 0.5 - (lat / math.pi)
+        x = u * (Wh - 1)
+        y = v * (Hh - 1)
+        x0 = torch.floor(x).long() % Wh
+        x1 = (x0 + 1) % Wh
+        y0 = torch.clamp(torch.floor(y).long(), 0, Hh - 1)
+        y1 = torch.clamp(y0 + 1, 0, Hh - 1)
+        wx = (x - x0.float()).unsqueeze(1)
+        wy = (y - y0.float()).unsqueeze(1)
+        hdr_flat = hdr_tex.view(-1, 3)
+        idx00 = (y0 * Wh + x0)
+        idx10 = (y0 * Wh + x1)
+        idx01 = (y1 * Wh + x0)
+        idx11 = (y1 * Wh + x1)
+        c00 = hdr_flat[idx00]
+        c10 = hdr_flat[idx10]
+        c01 = hdr_flat[idx01]
+        c11 = hdr_flat[idx11]
+        c0 = c00 * (1.0 - wx) + c10 * wx
+        c1 = c01 * (1.0 - wx) + c11 * wx
+        c = c0 * (1.0 - wy) + c1 * wy
+        return c
+
+    # reshape float image to (N_PIXELS, 3)
+    img_dev = float_img.view(N_PIXELS, 3)
+
+    # Primary misses: where in_hit == 0
+    primary_miss = (in_hit_dev == 0.0)
+    if primary_miss.any():
+        env = sample_equirect(hdr, rd_x_dev, rd_y_dev, rd_z_dev)
+        img_dev[primary_miss] = env[primary_miss]
+
+    # Reflection misses: pixels that had a hit but reflection missed (large refl_t) and have reflectivity
+    refl_miss = (in_hit_dev > 0.0) & (refl_t_dev > 1e8) & (hit_refl_dev > 0.0)
+    if refl_miss.any():
+        env_refl = sample_equirect(hdr, refl_dir_x_dev, refl_dir_y_dev, refl_dir_z_dev)
+        # add env contribution scaled by material reflectivity
+        add = env_refl * hit_refl_dev.unsqueeze(1)
+        img_dev[refl_miss] = img_dev[refl_miss] + add[refl_miss]
+
+    # now tonemap
     tonemap_kernel[conv_grid](
         float_img,
         uint8_dev,
