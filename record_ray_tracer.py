@@ -310,12 +310,21 @@ if use_ffmpeg:
         '-preset', 'fast',
         OUT_FILE,
     ]
-    ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
-    print(f"Streaming frames to ffmpeg -> {OUT_FILE}")
+    # Silence ffmpeg's console output by redirecting stdout/stderr to DEVNULL
+    ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE,
+                                   stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL)
+    if _has_tqdm:
+        tqdm.write(f"Streaming frames to ffmpeg -> {OUT_FILE}")
+    else:
+        print(f"Streaming frames to ffmpeg -> {OUT_FILE}")
 else:
     writer = cv2.VideoWriter(OUT_FILE, fourcc, FPS, (W, H))
 
-print(f"Rendering {FRAMES} frames ({FRAMES/FPS:.1f}s) to {OUT_FILE} at {FPS} FPS ({W}x{H})")
+if _has_tqdm:
+    tqdm.write(f"Rendering {FRAMES} frames ({FRAMES/FPS:.1f}s) to {OUT_FILE} at {FPS} FPS ({W}x{H})")
+else:
+    print(f"Rendering {FRAMES} frames ({FRAMES/FPS:.1f}s) to {OUT_FILE} at {FPS} FPS ({W}x{H})")
 
 start_time = time.time()
 frame_time_start = time.time()
@@ -367,7 +376,10 @@ try:
             try:
                 ffmpeg_proc.stdin.write(frame_bgr.tobytes())
             except BrokenPipeError:
-                print("ffmpeg pipe closed unexpectedly")
+                if _has_tqdm:
+                    tqdm.write("ffmpeg pipe closed unexpectedly")
+                else:
+                    print("ffmpeg pipe closed unexpectedly")
                 break
         else:
             writer.write(frame_bgr)
@@ -383,7 +395,10 @@ try:
                 avg_fps = completed / elapsed if elapsed > 0 else 0.0
                 remaining = FRAMES - completed
                 eta = remaining / avg_fps if avg_fps > 0 else float('inf')
-                print(f"Rendered {completed}/{FRAMES} frames — avg {avg_fps:.2f} FPS — ETA {eta:.1f}s")
+                if _has_tqdm:
+                    tqdm.write(f"Rendered {completed}/{FRAMES} frames — avg {avg_fps:.2f} FPS — ETA {eta:.1f}s")
+                else:
+                    print(f"Rendered {completed}/{FRAMES} frames — avg {avg_fps:.2f} FPS — ETA {eta:.1f}s")
 
 except Exception as e:
     print("Error during rendering:", e)
@@ -397,4 +412,7 @@ finally:
     if writer is not None:
         writer.release()
     total = time.time() - start_time
-    print(f"Done: {FRAMES} frames in {total:.2f}s => {FRAMES/total:.2f} FPS (overall)")
+    if _has_tqdm:
+        tqdm.write(f"Done: {FRAMES} frames in {total:.2f}s => {FRAMES/total:.2f} FPS (overall)")
+    else:
+        print(f"Done: {FRAMES} frames in {total:.2f}s => {FRAMES/total:.2f} FPS (overall)")
