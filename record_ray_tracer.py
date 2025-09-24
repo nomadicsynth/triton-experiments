@@ -26,6 +26,18 @@ FRAMES = args.frames
 FPS = args.fps
 OUT_FILE = args.out
 
+# Ensure the parent directory for the output file exists. If the user supplied
+# a path containing directories that don't yet exist, create them so ffmpeg
+# (or OpenCV) won't fail later when opening/writing the file. If creation
+# fails, exit with a helpful error message.
+out_parent = os.path.dirname(OUT_FILE)
+if out_parent:
+    try:
+        os.makedirs(out_parent, exist_ok=True)
+    except Exception as e:
+        print(f"Failed to create parent directory for output file '{out_parent}': {e}")
+        sys.exit(1)
+
 # Camera & light
 eye = torch.tensor([0.0, 0.0, -3.0], device="cuda")
 light = torch.tensor([5.0, 5.0, -5.0], device="cuda")
