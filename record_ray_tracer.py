@@ -28,6 +28,10 @@ H, W = args.height, args.width
 FRAMES = args.frames
 FPS = args.fps
 OUT_FILE = args.out
+# Force output duration to exactly FRAMES / FPS seconds (prevents ffmpeg from
+# extending the video to match a longer audio track). This is passed to ffmpeg
+# as the '-t' output option.
+DURATION_SECONDS_STR = f"{FRAMES / FPS:.6f}"
 
 # Ensure the parent directory for the output file exists. If the user supplied
 # a path containing directories that don't yet exist, create them so ffmpeg
@@ -357,6 +361,8 @@ if music_path is not None:
     ffmpeg_cmd += ['-map', '0:v:0', '-map', '1:a:0', '-c:a', 'aac', '-b:a', '192k']
 else:
     ffmpeg_cmd += ['-an']
+# Ensure ffmpeg produces a file with the exact requested duration.
+ffmpeg_cmd += ['-t', DURATION_SECONDS_STR]
 ffmpeg_cmd += ['-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'fast', OUT_FILE]
 # Silence ffmpeg's console output by redirecting stdout/stderr to DEVNULL
 ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE,
