@@ -8,6 +8,12 @@ import cv2
 import argparse
 import subprocess
 import shutil
+try:
+    from tqdm import tqdm
+    _has_tqdm = True
+except Exception:
+    tqdm = None
+    _has_tqdm = False
 
 # This script is derived from ray-tracer-1.py and records frames to a video file.
 
@@ -315,7 +321,10 @@ start_time = time.time()
 frame_time_start = time.time()
 
 try:
-    for frame in range(FRAMES):
+    iterator = range(FRAMES)
+    if _has_tqdm:
+        iterator = tqdm(range(FRAMES), desc="Rendering", unit="frame")
+    for frame in iterator:
         t_scalar = frame * 0.04
         t_sin = math.sin(t_scalar)
         t_cos = math.cos(t_scalar)
@@ -363,14 +372,18 @@ try:
         else:
             writer.write(frame_bgr)
 
-        # Status + ETA every 30 frames (and first/last)
-        if (frame + 1) % 30 == 0 or frame == 0 or frame == FRAMES - 1:
-            elapsed = time.time() - start_time
-            completed = frame + 1
-            avg_fps = completed / elapsed if elapsed > 0 else 0.0
-            remaining = FRAMES - completed
-            eta = remaining / avg_fps if avg_fps > 0 else float('inf')
-            print(f"Rendered {completed}/{FRAMES} frames — avg {avg_fps:.2f} FPS — ETA {eta:.1f}s")
+        # Update tqdm or periodic print for progress
+        if _has_tqdm:
+            # tqdm handles ETA display
+            iterator.set_postfix({'avg_fps': f"{(frame+1)/max(1e-6, time.time()-start_time):.2f}"})
+        else:
+            if (frame + 1) % 30 == 0 or frame == 0 or frame == FRAMES - 1:
+                elapsed = time.time() - start_time
+                completed = frame + 1
+                avg_fps = completed / elapsed if elapsed > 0 else 0.0
+                remaining = FRAMES - completed
+                eta = remaining / avg_fps if avg_fps > 0 else float('inf')
+                print(f"Rendered {completed}/{FRAMES} frames — avg {avg_fps:.2f} FPS — ETA {eta:.1f}s")
 
 except Exception as e:
     print("Error during rendering:", e)
