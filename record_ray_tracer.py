@@ -43,6 +43,10 @@ parser.add_argument("--audio-fade-out", type=float, default=0.0, help="Audio fad
 parser.add_argument("--frames-out-dir", type=str, default=None, help="If set, write individual image frames to this directory instead of encoding a video with ffmpeg. Useful for importing into Blender.")
 parser.add_argument("--frames-format", type=str, default="png", choices=["png", "exr"], help="Image format for raw frames (png or exr). PNG preserves 8-bit; EXR would preserve float HDR if supported.)")
 parser.add_argument("--raytracer-module", type=str, default="ray_tracer", help="Name of the Python module containing the render_frame function (default: ray_tracer)")
+parser.add_argument("--hdri-path", type=str, default=None, help="Path to HDRI EXR file to use for environment mapping")
+parser.add_argument("--hdri-flip-y", dest='hdri_flip_y', action='store_true', help="Flip HDRI Y axis (default: true)")
+parser.add_argument("--no-hdri-flip-y", dest='hdri_flip_y', action='store_false', help="Do not flip HDRI Y axis")
+parser.set_defaults(hdri_flip_y=True)
 args = parser.parse_args()
 
 # Dynamically import the raytracer module
@@ -55,6 +59,20 @@ except ImportError as e:
 except AttributeError:
     print(f"Module '{args.raytracer_module}' does not have a 'render_frame' function")
     sys.exit(1)
+
+# If the raytracer module supports HDRI configuration, pass the CLI options
+if hasattr(raytracer_module, 'set_hdri'):
+    try:
+        if args.hdri_path is not None:
+            raytracer_module.set_hdri(args.hdri_path, flip_y=args.hdri_flip_y)
+        else:
+            # If no path specified, at least set the flip flag if supported via module global
+            try:
+                setattr(raytracer_module, '_HDRI_FLIP_Y', args.hdri_flip_y)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"Warning: failed to configure HDRI on module '{args.raytracer_module}': {e}")
 
 H, W = args.height, args.width
 FRAMES = args.frames

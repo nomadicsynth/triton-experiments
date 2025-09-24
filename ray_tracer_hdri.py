@@ -3,12 +3,59 @@ import triton.language as tl
 import torch
 import math
 import numpy as np
-try:
-    import OpenEXR
-    import Imath
-except Exception:
-    OpenEXR = None
-    Imath = None
+import OpenEXR
+import Imath
+import torch.nn.functional as F
+
+# Module-level cached HDRI and orientation flag
+_HDRI_TENSOR = None
+_HDRI_FLIP_Y = True  # default: flip Y-axis to match user's request
+
+
+def _load_exr_to_cuda(path: str) -> torch.Tensor:
+    """Load an EXR file into a CUDA float32 tensor with shape (H, W, 3).
+    Prefers OpenEXR/Imath; falls back to imageio if needed.
+    """
+    f = OpenEXR.InputFile(path)
+    dw = f.header()['dataWindow']
+    W_exr = dw.max.x - dw.min.x + 1
+    H_exr = dw.max.y - dw.min.y + 1
+    pt = Imath.PixelType(Imath.PixelType.FLOAT)
+    chs = f.channels("RGB", pt)
+    r = np.frombuffer(chs[0], dtype=np.float32).reshape(H_exr, W_exr)
+    g = np.frombuffer(chs[1], dtype=np.float32).reshape(H_exr, W_exr)
+    b = np.frombuffer(chs[2], dtype=np.float32).reshape(H_exr, W_exr)
+    arr = np.stack([r, g, b], axis=2)
+    return torch.from_numpy(arr).to(device='cuda')
+
+
+def sample_equirect(hdr_tex: torch.Tensor, dir_x: torch.Tensor, dir_y: torch.Tensor, dir_z: torch.Tensor, flip_y: bool = False) -> torch.Tensor:
+    """Sample an equirectangular HDR texture given direction vectors.
+
+    hdr_tex: (Hh, Wh, 3) float32 CUDA tensor
+    dir_*: (N,) float32 CUDA tensors
+    returns: (N,3) float32 CUDA tensor
+    """
+    Hh, Wh, _ = hdr_tex.shape
+    # longitude and latitude
+    lon = torch.atan2(dir_x, dir_z)
+    dy = -dir_y if flip_y else dir_y
+    lat = torch.asin(torch.clamp(dy, -1.0, 1.0))
+    u = (lon / (2.0 * math.pi)) + 0.5
+    v = 0.5 - (lat / math.pi)
+
+    # Build normalized grid for grid_sample: grid coords are in [-1,1]
+    x = u * 2.0 - 1.0
+    y = v * 2.0 - 1.0
+
+    # prepare hdr for grid_sample: (1, C, H, W)
+    hdr_t = hdr_tex.permute(2, 0, 1).unsqueeze(0)  # (1,3,H,W)
+    N = dir_x.shape[0]
+    grid = torch.stack([x, y], dim=1).unsqueeze(1).unsqueeze(1)  # (N,1,1,2)
+    sampled = F.grid_sample(hdr_t.expand(N, -1, -1, -1), grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+    # sampled: (N, C, 1, 1) -> (N, C)
+    sampled = sampled.view(N, sampled.shape[1])
+    return sampled
 
 # Tune block size
 BLOCK: int = 256
@@ -347,69 +394,11 @@ def render_frame(frame_index, width, height):
         BLOCK
     )
 
-    # load HDRI (cached)
-    def _load_exr_to_cuda(path):
-        if OpenEXR is None or Imath is None:
-            # fallback to imageio if OpenEXR not available
-            try:
-                import imageio
-            except Exception:
-                raise RuntimeError("OpenEXR not available and imageio missing; cannot load EXR")
-            img = imageio.v3.imread(path, format='EXR-FI')
-            arr = np.asarray(img, dtype=np.float32)
-            return torch.from_numpy(arr).to(device='cuda')
-        f = OpenEXR.InputFile(path)
-        dw = f.header()['dataWindow']
-        W_exr = dw.max.x - dw.min.x + 1
-        H_exr = dw.max.y - dw.min.y + 1
-        pt = Imath.PixelType(Imath.PixelType.FLOAT)
-        chs = f.channels("RGB", pt)
-        r = np.frombuffer(chs[0], dtype=np.float32).reshape(H_exr, W_exr)
-        g = np.frombuffer(chs[1], dtype=np.float32).reshape(H_exr, W_exr)
-        b = np.frombuffer(chs[2], dtype=np.float32).reshape(H_exr, W_exr)
-        arr = np.stack([r, g, b], axis=2)
-        return torch.from_numpy(arr).to(device='cuda')
-
-    # cache HDRI tensor at module level to avoid reloading every frame
     global _HDRI_TENSOR
-    if '_HDRI_TENSOR' not in globals():
-        try:
-            _HDRI_TENSOR = _load_exr_to_cuda('assets/hdri/golden_bay_1k.exr')
-        except Exception:
-            # fall back to a small constant environment if loading fails
-            _HDRI_TENSOR = torch.ones((16, 32, 3), device='cuda', dtype=torch.float32) * 0.2
+    if _HDRI_TENSOR is None:
+        _HDRI_TENSOR = torch.ones((16, 32, 3), device='cuda', dtype=torch.float32) * 0.2
 
     hdr = _HDRI_TENSOR
-
-    # helper: sample equirectangular HDR by direction vectors (all tensors on CUDA)
-    def sample_equirect(hdr_tex, dir_x, dir_y, dir_z):
-        Hh, Wh, _ = hdr_tex.shape
-        # longitude (theta) around Y axis: atan2(x, z)
-        lon = torch.atan2(dir_x, dir_z)
-        lat = torch.asin(torch.clamp(dir_y, -1.0, 1.0))
-        u = (lon / (2.0 * math.pi)) + 0.5
-        v = 0.5 - (lat / math.pi)
-        x = u * (Wh - 1)
-        y = v * (Hh - 1)
-        x0 = torch.floor(x).long() % Wh
-        x1 = (x0 + 1) % Wh
-        y0 = torch.clamp(torch.floor(y).long(), 0, Hh - 1)
-        y1 = torch.clamp(y0 + 1, 0, Hh - 1)
-        wx = (x - x0.float()).unsqueeze(1)
-        wy = (y - y0.float()).unsqueeze(1)
-        hdr_flat = hdr_tex.view(-1, 3)
-        idx00 = (y0 * Wh + x0)
-        idx10 = (y0 * Wh + x1)
-        idx01 = (y1 * Wh + x0)
-        idx11 = (y1 * Wh + x1)
-        c00 = hdr_flat[idx00]
-        c10 = hdr_flat[idx10]
-        c01 = hdr_flat[idx01]
-        c11 = hdr_flat[idx11]
-        c0 = c00 * (1.0 - wx) + c10 * wx
-        c1 = c01 * (1.0 - wx) + c11 * wx
-        c = c0 * (1.0 - wy) + c1 * wy
-        return c
 
     # reshape float image to (N_PIXELS, 3)
     img_dev = float_img.view(N_PIXELS, 3)
@@ -417,13 +406,13 @@ def render_frame(frame_index, width, height):
     # Primary misses: where in_hit == 0
     primary_miss = (in_hit_dev == 0.0)
     if primary_miss.any():
-        env = sample_equirect(hdr, rd_x_dev, rd_y_dev, rd_z_dev)
+        env = sample_equirect(hdr, rd_x_dev, rd_y_dev, rd_z_dev, flip_y=_HDRI_FLIP_Y)
         img_dev[primary_miss] = env[primary_miss]
 
     # Reflection misses: pixels that had a hit but reflection missed (large refl_t) and have reflectivity
     refl_miss = (in_hit_dev > 0.0) & (refl_t_dev > 1e8) & (hit_refl_dev > 0.0)
     if refl_miss.any():
-        env_refl = sample_equirect(hdr, refl_dir_x_dev, refl_dir_y_dev, refl_dir_z_dev)
+        env_refl = sample_equirect(hdr, refl_dir_x_dev, refl_dir_y_dev, refl_dir_z_dev, flip_y=_HDRI_FLIP_Y)
         # add env contribution scaled by material reflectivity
         add = env_refl * hit_refl_dev.unsqueeze(1)
         img_dev[refl_miss] = img_dev[refl_miss] + add[refl_miss]
@@ -436,11 +425,25 @@ def render_frame(frame_index, width, height):
         CONV_BLOCK
     )
 
-    # Async copy to host pinned memory
-    with torch.cuda.stream(copy_stream):
-        host_img.view(-1).copy_(uint8_dev, non_blocking=True)
-        copy_done.record(copy_stream)
+    # copy back to host pinned memory and return
+    # uint8_dev is a 1D CUDA tensor with interleaved RGB; host_img is pinned CPU memory (H,W,3)
+    try:
+        host_img.view(-1).copy_(uint8_dev.to('cpu'))
+    except Exception:
+        # fallback to synchronous copy path
+        host_img.view(-1)[:] = uint8_dev.cpu().numpy()
 
-    # Wait for copy to complete then write frame
-    copy_done.synchronize()
     return host_img
+
+
+def set_hdri(path: str, flip_y: bool = True):
+    """Load HDRI at `path` into a cached cuda tensor and set vertical flip flag.
+    Call this from the runner before rendering frames.
+    """
+    global _HDRI_TENSOR, _HDRI_FLIP_Y
+    _HDRI_FLIP_Y = flip_y
+    try:
+        _HDRI_TENSOR = _load_exr_to_cuda(path)
+    except Exception as e:
+        print(f"Failed to load HDRI '{path}': {e}. Using fallback constant environment.")
+        _HDRI_TENSOR = torch.ones((16, 32, 3), device='cuda', dtype=torch.float32) * 0.2
