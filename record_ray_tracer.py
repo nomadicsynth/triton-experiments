@@ -435,7 +435,7 @@ start_time = time.time()
 frame_time_start = time.time()
 
 try:
-    iterator = tqdm(range(FRAMES), desc="Rendering", unit="frame")
+    iterator = tqdm(range(FRAMES), desc="Rendering", unit="frame", dynamic_ncols=True)
     for frame in iterator:
         t_scalar = frame * 0.04
         t_sin = math.sin(t_scalar)
