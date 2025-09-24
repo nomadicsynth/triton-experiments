@@ -9,3 +9,7 @@ glfw
 cuda-python
 tqdm
 
+# For EXR writing (optional)
+OpenEXR
+Imath
+

@@ -11,6 +11,15 @@ import os
 import sys
 import tempfile
 from tqdm import tqdm
+import numpy as np
+
+# Optional OpenEXR imports; only required when writing EXR frames
+try:
+    import OpenEXR
+    import Imath
+    _HAS_OPENEXR = True
+except Exception:
+    _HAS_OPENEXR = False
 
 # This script is derived from ray-tracer-1.py and records frames to a video file.
 
@@ -478,9 +487,29 @@ try:
                     tqdm.write(f"Failed to save frame {frame} to '{filename}': {e}")
                     break
             else:
-                # EXR or other formats not implemented; inform the user
-                tqdm.write(f"Requested frames format '{frames_format}' is not supported in this build. Use 'png'.")
-                break
+                # EXR export
+                if not _HAS_OPENEXR:
+                    tqdm.write("OpenEXR/Imath not installed; cannot write EXR files. Please install OpenEXR and Imath (added to requirements.txt).")
+                    break
+                try:
+                    # Convert uint8 RGB (H,W,3) to float32 linear RGB in range [0,1]
+                    arr = np.asarray(frame_rgb, dtype=np.uint8)
+                    # Convert to float32 and normalize
+                    f = (arr.astype(np.float32) / 255.0)
+                    # Flip to channel-first order and convert to bytes
+                    R = (f[..., 0].astype(np.float32)).tobytes()
+                    G = (f[..., 1].astype(np.float32)).tobytes()
+                    B = (f[..., 2].astype(np.float32)).tobytes()
+
+                    header = OpenEXR.Header(W, H)
+                    pt = Imath.PixelType(Imath.PixelType.FLOAT)
+                    header['channels'] = dict(R=Imath.Channel(pt), G=Imath.Channel(pt), B=Imath.Channel(pt))
+                    exr = OpenEXR.OutputFile(filename, header)
+                    exr.writePixels({'R': R, 'G': G, 'B': B})
+                    exr.close()
+                except Exception as e:
+                    tqdm.write(f"Failed to write EXR frame {frame} to '{filename}': {e}")
+                    break
         else:
             frame_bgr = frame_rgb[..., ::-1]
             if ffmpeg_proc is not None:
