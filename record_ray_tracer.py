@@ -33,6 +33,8 @@ parser.add_argument("--video-fade-in", type=float, default=0.0, help="Video fade
 parser.add_argument("--video-fade-out", type=float, default=0.0, help="Video fade out duration in seconds")
 parser.add_argument("--audio-fade-in", type=float, default=0.0, help="Audio fade in duration in seconds")
 parser.add_argument("--audio-fade-out", type=float, default=0.0, help="Audio fade out duration in seconds")
+parser.add_argument("--frames-out-dir", type=str, default=None, help="If set, write individual image frames to this directory instead of encoding a video with ffmpeg. Useful for importing into Blender.")
+parser.add_argument("--frames-format", type=str, default="png", choices=["png", "exr"], help="Image format for raw frames (png or exr). PNG preserves 8-bit; EXR would preserve float HDR if supported.)")
 args = parser.parse_args()
 
 H, W = args.height, args.width
@@ -326,6 +328,8 @@ use_ffmpeg = shutil.which("ffmpeg") is not None
 ffmpeg_proc = None
 music_path = args.music
 loop_music = args.loop_music
+frames_out_dir = args.frames_out_dir
+frames_format = args.frames_format
 
 # Validate fade durations
 if args.video_fade_in + args.video_fade_out > DURATION_SECONDS:
@@ -335,8 +339,8 @@ if music_path is not None and args.audio_fade_in + args.audio_fade_out > DURATIO
     print("Audio fade in and out durations combined cannot exceed video duration")
     sys.exit(1)
 
-if not use_ffmpeg:
-    print("This script requires ffmpeg to write video. Please install ffmpeg.")
+if frames_out_dir is None and not use_ffmpeg:
+    print("This script requires ffmpeg to write video. Please install ffmpeg, or use --frames-out-dir to write raw frames instead.")
     sys.exit(1)
 
 # Sanity-check the music file early so we fail fast if path is invalid
@@ -368,41 +372,53 @@ if music_path is not None:
         tqdm.write("Warning: ffprobe/ffmpeg not found; cannot verify audio file before rendering.")
 
 # Spawn ffmpeg to read raw BGR24 frames from stdin and encode to mp4
-ffmpeg_cmd = ["ffmpeg", '-y']
-# Video input from stdin
-ffmpeg_cmd += ['-f', 'rawvideo', '-pix_fmt', 'bgr24', '-s', f"{W}x{H}", '-r', str(FPS), '-i', '-']
-if music_path is not None:
-    # If music provided, add it as a second input. If looping desired, use -stream_loop.
-    if loop_music:
-        # Use -stream_loop before the input to loop the audio indefinitely (-1 loops forever)
-        ffmpeg_cmd += ['-stream_loop', '-1']
-    ffmpeg_cmd += ['-i', music_path]
-    # Map video from first input and audio from second, set audio codec
-    ffmpeg_cmd += ['-map', '0:v:0', '-map', '1:a:0', '-c:a', 'aac', '-b:a', '192k']
-else:
-    ffmpeg_cmd += ['-an']
-# Add fade filters
-if args.video_fade_in > 0 or args.video_fade_out > 0:
-    vf_parts = []
-    if args.video_fade_in > 0:
-        vf_parts.append(f"fade=t=in:st=0:d={args.video_fade_in}")
-    if args.video_fade_out > 0:
-        vf_parts.append(f"fade=t=out:st={DURATION_SECONDS - args.video_fade_out}:d={args.video_fade_out}")
-    ffmpeg_cmd += ['-filter:v', ','.join(vf_parts)]
-if music_path is not None and (args.audio_fade_in > 0 or args.audio_fade_out > 0):
-    af_parts = []
-    if args.audio_fade_in > 0:
-        af_parts.append(f"afade=t=in:st=0:d={args.audio_fade_in}")
-    if args.audio_fade_out > 0:
-        af_parts.append(f"afade=t=out:st={DURATION_SECONDS - args.audio_fade_out}:d={args.audio_fade_out}")
-    ffmpeg_cmd += ['-filter:a', ','.join(af_parts)]
-# Ensure ffmpeg produces a file with the exact requested duration.
-ffmpeg_cmd += ['-t', DURATION_SECONDS_STR]
-ffmpeg_cmd += ['-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'fast', OUT_FILE]
-# Silence ffmpeg's console output by redirecting stdout/stderr to DEVNULL
-ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE,
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL)
+ffmpeg_proc = None
+
+# If frames_out_dir is set, we'll write individual image files and skip spawning ffmpeg
+if frames_out_dir is None:
+    ffmpeg_cmd = ["ffmpeg", '-y']
+    # Video input from stdin
+    ffmpeg_cmd += ['-f', 'rawvideo', '-pix_fmt', 'bgr24', '-s', f"{W}x{H}", '-r', str(FPS), '-i', '-']
+    if music_path is not None:
+        # If music provided, add it as a second input. If looping desired, use -stream_loop.
+        if loop_music:
+            # Use -stream_loop before the input to loop the audio indefinitely (-1 loops forever)
+            ffmpeg_cmd += ['-stream_loop', '-1']
+        ffmpeg_cmd += ['-i', music_path]
+        # Map video from first input and audio from second, set audio codec
+        ffmpeg_cmd += ['-map', '0:v:0', '-map', '1:a:0', '-c:a', 'aac', '-b:a', '192k']
+    else:
+        ffmpeg_cmd += ['-an']
+    # Add fade filters
+    if args.video_fade_in > 0 or args.video_fade_out > 0:
+        vf_parts = []
+        if args.video_fade_in > 0:
+            vf_parts.append(f"fade=t=in:st=0:d={args.video_fade_in}")
+        if args.video_fade_out > 0:
+            vf_parts.append(f"fade=t=out:st={DURATION_SECONDS - args.video_fade_out}:d={args.video_fade_out}")
+        ffmpeg_cmd += ['-filter:v', ','.join(vf_parts)]
+    if music_path is not None and (args.audio_fade_in > 0 or args.audio_fade_out > 0):
+        af_parts = []
+        if args.audio_fade_in > 0:
+            af_parts.append(f"afade=t=in:st=0:d={args.audio_fade_in}")
+        if args.audio_fade_out > 0:
+            af_parts.append(f"afade=t=out:st={DURATION_SECONDS - args.audio_fade_out}:d={args.audio_fade_out}")
+        ffmpeg_cmd += ['-filter:a', ','.join(af_parts)]
+    # Ensure ffmpeg produces a file with the exact requested duration.
+    ffmpeg_cmd += ['-t', DURATION_SECONDS_STR]
+    ffmpeg_cmd += ['-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'fast', OUT_FILE]
+    # Silence ffmpeg's console output by redirecting stdout/stderr to DEVNULL
+    ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE,
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+
+# If requested, create frames output directory
+if frames_out_dir is not None:
+    try:
+        os.makedirs(frames_out_dir, exist_ok=True)
+    except Exception as e:
+        print(f"Failed to create frames output directory '{frames_out_dir}': {e}")
+        sys.exit(1)
 
 tqdm.write(f"Rendering {FRAMES} frames ({FRAMES/FPS:.1f}s) to {OUT_FILE} at {FPS} FPS ({W}x{H})")
 
@@ -448,14 +464,32 @@ try:
 
         # Wait for copy to complete then write frame
         copy_done.synchronize()
-        frame_bgr = host_img.numpy()[..., ::-1]
-        if ffmpeg_proc is not None:
-            # write raw bytes to ffmpeg stdin
-            try:
-                ffmpeg_proc.stdin.write(frame_bgr.tobytes())
-            except BrokenPipeError:
-                tqdm.write("ffmpeg pipe closed unexpectedly")
+        # host_img is in RGB order; for ffmpeg we need BGR24. For saving PNG keep RGB.
+        frame_rgb = host_img.numpy()
+        if frames_out_dir is not None:
+            # Save frame as an image file suitable for Blender import
+            pad = max(6, len(str(FRAMES)))
+            filename = os.path.join(frames_out_dir, f"frame_{frame:0{pad}d}.{frames_format}")
+            if frames_format == 'png':
+                img = Image.fromarray(frame_rgb)
+                try:
+                    img.save(filename)
+                except Exception as e:
+                    tqdm.write(f"Failed to save frame {frame} to '{filename}': {e}")
+                    break
+            else:
+                # EXR or other formats not implemented; inform the user
+                tqdm.write(f"Requested frames format '{frames_format}' is not supported in this build. Use 'png'.")
                 break
+        else:
+            frame_bgr = frame_rgb[..., ::-1]
+            if ffmpeg_proc is not None:
+                # write raw bytes to ffmpeg stdin
+                try:
+                    ffmpeg_proc.stdin.write(frame_bgr.tobytes())
+                except BrokenPipeError:
+                    tqdm.write("ffmpeg pipe closed unexpectedly")
+                    break
         
         # Update tqdm postfix with average FPS
         iterator.set_postfix({'avg_fps': f"{(frame+1)/max(1e-6, time.time()-start_time):.2f}"})
