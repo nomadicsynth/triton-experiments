@@ -1,6 +1,6 @@
 out/
 out.*
-out_video.mp4
+out*
 __pycache__/
 .venv/
 venv/
